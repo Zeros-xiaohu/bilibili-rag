@@ -90,6 +90,30 @@ npm run dev
 ```
 前端页面：`http://localhost:3000`
 
+### Docker 本地一键部署
+
+适合只想快速跑起来的本地环境。Docker 会同时启动后端和前端，数据会持久化到本地 `data/`，日志会写到 `logs/`。
+
+```bash
+cp .env.example .env
+# 编辑 .env，至少填写 DASHSCOPE_API_KEY 或 OPENAI_API_KEY
+docker compose up --build
+```
+
+启动后访问：
+- 前端页面：`http://localhost:3000`
+- 后端文档：`http://localhost:8000/docs`
+
+停止服务：
+```bash
+docker compose down
+```
+
+如果修改了 `.env` 中的模型或 API Key，重新启动容器：
+```bash
+docker compose up --build
+```
+
 ---
 
 ## 🧠 工作流程
