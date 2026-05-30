@@ -321,7 +321,13 @@ async def _sync_folder(
 
             if needs_fetch:
                 content = await content_fetcher.fetch_content(
-                    bvid, cid=meta["cid"], title=meta["title"]
+                    bvid,
+                    cid=meta["cid"],
+                    title=meta["title"],
+                    description=meta.get("intro"),
+                    owner_name=meta.get("owner_name"),
+                    owner_mid=meta.get("owner_mid"),
+                    duration=meta.get("duration"),
                 )
                 new_text = (content.content or "").strip() if content else ""
                 new_source = content.source.value if content else None
@@ -353,12 +359,22 @@ async def _sync_folder(
                             content=(cache.content or "").strip(),
                             source=ContentSource.ASR,
                             outline=cache.outline_json,
+                            description=meta.get("intro"),
+                            owner_name=meta.get("owner_name"),
+                            owner_mid=meta.get("owner_mid"),
+                            duration=meta.get("duration"),
                         )
                         cache.is_processed = True
                         logger.info(f"[{bvid}] 使用缓存 ASR 内容重建向量")
                     else:
                         content = await content_fetcher.fetch_content(
-                            bvid, cid=meta["cid"], title=meta["title"]
+                            bvid,
+                            cid=meta["cid"],
+                            title=meta["title"],
+                            description=meta.get("intro"),
+                            owner_name=meta.get("owner_name"),
+                            owner_mid=meta.get("owner_mid"),
+                            duration=meta.get("duration"),
                         )
                         if cache:
                             cache.content = content.content

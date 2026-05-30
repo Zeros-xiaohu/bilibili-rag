@@ -20,6 +20,7 @@ class Settings(BaseSettings):
     openai_base_url: str = Field(default="https://api.openai.com/v1", env="OPENAI_BASE_URL")
     llm_model: str = Field(default="gpt-4-turbo", env="LLM_MODEL")
     embedding_model: str = Field(default="text-embedding-3-small", env="EMBEDDING_MODEL")
+    chat_use_llm_router: bool = Field(default=False, env="CHAT_USE_LLM_ROUTER")
 
     # DashScope ASR
     dashscope_base_url: str = Field(
@@ -47,6 +48,12 @@ class Settings(BaseSettings):
         default="./data/chroma_db",
         env="CHROMA_PERSIST_DIRECTORY"
     )
+
+    # Retrieval
+    retrieval_candidate_k: int = Field(default=24, env="RETRIEVAL_CANDIDATE_K")
+    retrieval_top_k: int = Field(default=8, env="RETRIEVAL_TOP_K")
+    retrieval_mmr_fetch_k: int = Field(default=32, env="RETRIEVAL_MMR_FETCH_K")
+    retrieval_mmr_lambda: float = Field(default=0.55, env="RETRIEVAL_MMR_LAMBDA")
     
     class Config:
         env_file = ".env"

@@ -116,6 +116,40 @@ class RAGService:
 字幕内容："""),
             ("human", "{content}")
         ])
+
+    def _build_metadata_document(self, video: VideoContent) -> Optional[Document]:
+        """Build a compact searchable metadata document for title/intro recall."""
+        parts = [f"视频标题：{video.title or '未知标题'}"]
+        if video.owner_name:
+            parts.append(f"UP主：{video.owner_name}")
+        if video.description:
+            parts.append(f"视频简介：{video.description}")
+        if video.duration:
+            parts.append(f"视频时长：{video.duration} 秒")
+        if video.outline:
+            outline_titles = []
+            for item in video.outline:
+                title = (item.get("title") or "").strip() if isinstance(item, dict) else ""
+                if title:
+                    outline_titles.append(title)
+            if outline_titles:
+                parts.append("内容提纲：" + "；".join(outline_titles[:8]))
+
+        content = "\n".join(part for part in parts if part).strip()
+        if len(content) < 10:
+            return None
+
+        return Document(
+            page_content=content,
+            metadata={
+                "bvid": video.bvid,
+                "title": video.title or "未知标题",
+                "source": video.source.value,
+                "doc_type": "metadata",
+                "chunk_index": -1,
+                "url": f"https://www.bilibili.com/video/{video.bvid}",
+            },
+        )
     
     def add_video_content(self, video: VideoContent) -> int:
         """
@@ -167,8 +201,12 @@ class RAGService:
             logger.warning(f"[{video.bvid}] 没有有效的文档块")
             return 0
         
-        # 创建文档
+        # 创建文档。额外加入一条元信息文档，提升标题/简介/UP主类问题召回率。
         documents = []
+        metadata_doc = self._build_metadata_document(video)
+        if metadata_doc:
+            documents.append(metadata_doc)
+
         for i, chunk in enumerate(valid_chunks):
             doc = Document(
                 page_content=chunk.strip(),  # 确保是干净的字符串
@@ -176,6 +214,7 @@ class RAGService:
                     "bvid": video.bvid,
                     "title": title,
                     "source": video.source.value,
+                    "doc_type": "chunk",
                     "chunk_index": i,
                     "url": f"https://www.bilibili.com/video/{video.bvid}"
                 }
@@ -228,7 +267,14 @@ class RAGService:
             "chunks": total_chunks
         }
     
-    def search(self, query: str, k: int = 5, bvids: Optional[List[str]] = None) -> List[Document]:
+    def search(
+        self,
+        query: str,
+        k: int = 5,
+        bvids: Optional[List[str]] = None,
+        fetch_k: Optional[int] = None,
+        use_mmr: bool = True,
+    ) -> List[Document]:
         """
         检索相关内容
         """
@@ -237,10 +283,28 @@ class RAGService:
             return []
             
         try:
-            if bvids:
-                docs = self.vectorstore.similarity_search(query, k=k, filter={"bvid": {"$in": bvids}})
-            else:
-                docs = self.vectorstore.similarity_search(query, k=k)
+            requested_k = max(1, k)
+            candidate_k = max(fetch_k or settings.retrieval_mmr_fetch_k, requested_k)
+            search_filter = {"bvid": {"$in": bvids}} if bvids else None
+            docs: List[Document] = []
+
+            if use_mmr:
+                try:
+                    docs = self.vectorstore.max_marginal_relevance_search(
+                        query,
+                        k=requested_k,
+                        fetch_k=candidate_k,
+                        lambda_mult=settings.retrieval_mmr_lambda,
+                        filter=search_filter,
+                    )
+                except Exception as e:
+                    logger.warning(f"MMR 检索失败，降级 similarity_search: {e}")
+
+            if not docs:
+                if search_filter:
+                    docs = self.vectorstore.similarity_search(query, k=requested_k, filter=search_filter)
+                else:
+                    docs = self.vectorstore.similarity_search(query, k=requested_k)
 
             logger.info(f"检索完成：query='{query}'，召回={len(docs)}")
             for idx, doc in enumerate(docs):
@@ -310,7 +374,12 @@ class RAGService:
         
         # 检索相关文档
         try:
-            docs = self.search(question, k=k, bvids=bvids if bvids else None)
+            docs = self.search(
+                question,
+                k=max(k, settings.retrieval_top_k),
+                bvids=bvids if bvids else None,
+                fetch_k=settings.retrieval_mmr_fetch_k,
+            )
         except Exception as e:
             logger.error(f"检索失败: {e}")
             return await self._fallback_answer(question, f"检索时遇到问题")

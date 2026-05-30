@@ -25,6 +25,7 @@ export default function ChatPanel({ statsKey, sessionId, folderIds }: Props) {
   const [stats, setStats] = useState<KnowledgeStats | null>(null);
   const endRef = useRef<HTMLDivElement>(null);
   const marker = "[[SOURCES_JSON]]";
+  const contentStartMarker = "[[CONTENT_START]]";
 
   useEffect(() => {
     knowledgeApi.getStats().then(setStats).catch(() => { });
@@ -67,9 +68,42 @@ export default function ChatPanel({ statsKey, sessionId, folderIds }: Props) {
       const reader = response.body.getReader();
       const decoder = new TextDecoder("utf-8");
       let done = false;
-      let buffer = "";
-      let sourcesJson = "";
-      let inSources = false;
+      let answerBuffer = "";
+      let pendingBuffer = "";
+      let metadataParsed = false;
+      let legacySourcesJson = "";
+      let inLegacySources = false;
+      let pendingSources: Array<{ bvid: string; title: string; url: string }> = [];
+
+      const parseSources = (raw: string) => {
+        if (!raw) return [];
+        try {
+          const parsed = JSON.parse(raw);
+          if (Array.isArray(parsed)) {
+            return parsed;
+          }
+        } catch {
+          // 忽略解析错误，避免影响主文本
+        }
+        return [];
+      };
+
+      const revealSources = () => {
+        if (pendingSources.length === 0) return;
+        setMessages((prev) =>
+          prev.map((m) =>
+            m.id === assistantId ? { ...m, sources: pendingSources } : m
+          )
+        );
+      };
+
+      const applyContent = () => {
+        setMessages((prev) =>
+          prev.map((m) =>
+            m.id === assistantId ? { ...m, content: answerBuffer } : m
+          )
+        );
+      };
 
       while (!done) {
         const { value, done: doneReading } = await reader.read();
@@ -77,41 +111,58 @@ export default function ChatPanel({ statsKey, sessionId, folderIds }: Props) {
         if (value) {
           const chunk = decoder.decode(value, { stream: !done });
           if (chunk) {
-            if (inSources) {
-              sourcesJson += chunk;
-            } else {
-              buffer += chunk;
-              const markerIndex = buffer.indexOf(marker);
-              if (markerIndex !== -1) {
-                const contentPart = buffer.slice(0, markerIndex);
-                sourcesJson = buffer.slice(markerIndex + marker.length);
-                buffer = contentPart;
-                inSources = true;
+            if (!metadataParsed) {
+              pendingBuffer += chunk;
+              const markerIndex = pendingBuffer.indexOf(marker);
+              const contentStartIndex = pendingBuffer.indexOf(contentStartMarker);
+
+              if (markerIndex !== -1 && contentStartIndex !== -1 && markerIndex < contentStartIndex) {
+                const rawSources = pendingBuffer.slice(markerIndex + marker.length, contentStartIndex);
+                pendingSources = parseSources(rawSources);
+                answerBuffer += pendingBuffer.slice(contentStartIndex + contentStartMarker.length);
+                pendingBuffer = "";
+                metadataParsed = true;
+                applyContent();
+              } else if (markerIndex === -1 && pendingBuffer.length > marker.length + contentStartMarker.length) {
+                // 兼容没有元数据头的旧流式响应。
+                answerBuffer += pendingBuffer;
+                pendingBuffer = "";
+                metadataParsed = true;
+                applyContent();
               }
-              setMessages((prev) =>
-                prev.map((m) =>
-                  m.id === assistantId ? { ...m, content: buffer } : m
-                )
-              );
+            } else {
+              if (inLegacySources) {
+                legacySourcesJson += chunk;
+              } else {
+                answerBuffer += chunk;
+                const legacyMarkerIndex = answerBuffer.indexOf(marker);
+                if (legacyMarkerIndex !== -1) {
+                  legacySourcesJson = answerBuffer.slice(legacyMarkerIndex + marker.length);
+                  answerBuffer = answerBuffer.slice(0, legacyMarkerIndex);
+                  inLegacySources = true;
+                }
+              }
+              applyContent();
             }
           }
         }
       }
 
-      if (sourcesJson) {
-        try {
-          const parsed = JSON.parse(sourcesJson);
-          if (Array.isArray(parsed)) {
-            setMessages((prev) =>
-              prev.map((m) =>
-                m.id === assistantId ? { ...m, sources: parsed } : m
-              )
-            );
-          }
-        } catch {
-          // 忽略解析错误，避免影响主文本
+      if (!metadataParsed && pendingBuffer) {
+        const markerIndex = pendingBuffer.indexOf(marker);
+        const contentStartIndex = pendingBuffer.indexOf(contentStartMarker);
+        if (markerIndex !== -1 && contentStartIndex !== -1 && markerIndex < contentStartIndex) {
+          pendingSources = parseSources(pendingBuffer.slice(markerIndex + marker.length, contentStartIndex));
+          answerBuffer += pendingBuffer.slice(contentStartIndex + contentStartMarker.length);
+        } else {
+          answerBuffer += pendingBuffer;
         }
+        applyContent();
       }
+      if (legacySourcesJson) {
+        pendingSources = parseSources(legacySourcesJson);
+      }
+      revealSources();
     } catch {
       try {
         const res = await chatApi.ask(q, sessionId, folderIds);

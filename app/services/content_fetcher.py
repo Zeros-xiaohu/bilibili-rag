@@ -31,7 +31,16 @@ class ContentFetcher:
         self.bili = bilibili_service
         self.asr = asr_service
     
-    async def fetch_content(self, bvid: str, cid: int = None, title: str = None) -> VideoContent:
+    async def fetch_content(
+        self,
+        bvid: str,
+        cid: int = None,
+        title: str = None,
+        description: str = None,
+        owner_name: str = None,
+        owner_mid: int = None,
+        duration: int = None,
+    ) -> VideoContent:
         """
         获取视频内容，自动降级
         
@@ -58,10 +67,18 @@ class ContentFetcher:
                     bvid=bvid,
                     title=title or "未知标题",
                     content="无法获取视频信息",
-                    source=ContentSource.BASIC_INFO
+                    source=ContentSource.BASIC_INFO,
+                    description=description,
+                    owner_name=owner_name,
+                    owner_mid=owner_mid,
+                    duration=duration,
                 )
         
-        description = video_info.get("desc", "") if video_info else ""
+        owner = (video_info.get("owner") or {}) if video_info else {}
+        description = description or (video_info.get("desc", "") if video_info else "")
+        owner_name = owner_name or owner.get("name")
+        owner_mid = owner_mid or owner.get("mid")
+        duration = duration or (video_info.get("duration") if video_info else None)
         
         # Level 1: 跳过 AI 摘要，优先使用 ASR
         logger.info(f"[{bvid}] 已跳过 AI 摘要，优先使用 ASR")
@@ -73,7 +90,11 @@ class ContentFetcher:
                 bvid=bvid,
                 title=title,
                 content=asr_text,
-                source=ContentSource.ASR
+                source=ContentSource.ASR,
+                description=description,
+                owner_name=owner_name,
+                owner_mid=owner_mid,
+                duration=duration,
             )
         
         # ASR 失败时，补齐基础信息（避免遗漏简介）
@@ -96,7 +117,11 @@ class ContentFetcher:
             bvid=bvid,
             title=title,
             content=basic_content,
-            source=ContentSource.BASIC_INFO
+            source=ContentSource.BASIC_INFO,
+            description=description,
+            owner_name=owner_name,
+            owner_mid=owner_mid,
+            duration=duration,
         )
 
     async def _try_asr(self, bvid: str, cid: int) -> Optional[str]:
@@ -495,7 +520,15 @@ class ContentFetcher:
                 continue
             
             try:
-                content = await self.fetch_content(bvid, cid, title)
+                content = await self.fetch_content(
+                    bvid,
+                    cid,
+                    title,
+                    description=video.get("description") or video.get("intro"),
+                    owner_name=(video.get("owner") or {}).get("name") if isinstance(video.get("owner"), dict) else video.get("owner_name"),
+                    owner_mid=(video.get("owner") or {}).get("mid") if isinstance(video.get("owner"), dict) else video.get("owner_mid"),
+                    duration=video.get("duration"),
+                )
                 results.append(content)
                 
                 if progress_callback:
@@ -507,7 +540,11 @@ class ContentFetcher:
                     bvid=bvid,
                     title=title or bvid,
                     content=f"处理失败: {str(e)}",
-                    source=ContentSource.BASIC_INFO
+                    source=ContentSource.BASIC_INFO,
+                    description=video.get("description") or video.get("intro"),
+                    owner_name=(video.get("owner") or {}).get("name") if isinstance(video.get("owner"), dict) else video.get("owner_name"),
+                    owner_mid=(video.get("owner") or {}).get("mid") if isinstance(video.get("owner"), dict) else video.get("owner_mid"),
+                    duration=video.get("duration"),
                 ))
             
             # 控制请求速率

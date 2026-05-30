@@ -2,8 +2,10 @@
 Bilibili RAG 知识库系统
 对话路由 - 智能问答
 """
+import asyncio
 import re
 import json
+import time
 from typing import List, Optional
 from fastapi import APIRouter, HTTPException, Depends
 from fastapi.responses import StreamingResponse
@@ -17,8 +19,16 @@ from app.database import get_db
 from app.models import ChatRequest, ChatResponse, FavoriteFolder, FavoriteVideo, VideoCache
 from app.config import settings
 from app.routers.knowledge import get_rag_service
+from app.services.retrieval import (
+    build_snippet,
+    extract_keywords as extract_retrieval_keywords,
+    keyword_score,
+    merge_ranked_documents,
+)
 
 router = APIRouter(prefix="/chat", tags=["对话"])
+SOURCES_MARKER = "[[SOURCES_JSON]]"
+CONTENT_START_MARKER = "[[CONTENT_START]]"
 
 def _get_llm_client() -> OpenAI:
     """获取 LLM 客户端"""
@@ -147,8 +157,11 @@ def _is_summary_question(question: str) -> bool:
 
 def _is_general_question(question: str) -> bool:
     """通用闲聊/与收藏无关的问题"""
-    general_terms = ["你好", "嗨", "哈喽", "hello", "hi", "在吗", "你是谁", "你能做什么", "谢谢", "晚安", "早安", "早上好"]
-    cleaned = re.sub(r"[\\W_]+", "", question, flags=re.UNICODE)
+    general_terms = [
+        "你好", "嗨", "哈喽", "hello", "hi", "ok", "在吗", "你是谁", "你能做什么",
+        "谢谢", "好的", "好", "收到", "明白", "可以", "嗯", "嗯嗯", "晚安", "早安", "早上好",
+    ]
+    cleaned = re.sub(r"[\W_]+", "", question, flags=re.UNICODE)
     lowered = cleaned.lower()
     residual = lowered
     for term in general_terms:
@@ -166,7 +179,7 @@ def _is_overview_question(question: str) -> bool:
 
 def _route_with_rules(question: str, is_collection_intent: bool, related: bool) -> str:
     """规则路由兜底"""
-    if _is_general_question(question) and not is_collection_intent:
+    if _is_general_question(question):
         return "direct"
     if _is_list_question(question):
         return "db_list"
@@ -209,19 +222,7 @@ def _route_with_llm(question: str) -> tuple[Optional[str], str]:
 
 def _extract_keywords(question: str) -> List[str]:
     """提取用于过滤的关键词"""
-    stopwords = {
-        "什么", "怎么", "如何", "是否", "可以", "哪个", "哪些", "请问", "一下", "为什么",
-        "有没有", "能不能", "能否", "是不是", "是什么", "多少", "哪里", "讲讲", "介绍",
-        "总结", "概括", "分析", "解释", "说明", "评价", "区别", "内容", "视频",
-    }
-    keywords: List[str] = []
-    for kw in re.findall(r"[\u4e00-\u9fff]{2,}", question):
-        if kw not in stopwords and kw not in keywords:
-            keywords.append(kw)
-    for kw in re.findall(r"[A-Za-z0-9]{2,}", question):
-        if kw not in keywords:
-            keywords.append(kw)
-    return keywords
+    return extract_retrieval_keywords(question)
 
 def _filter_docs_by_keywords(docs: List[Document], question: str) -> List[Document]:
     """根据关键词过滤召回内容，减少噪声"""
@@ -236,6 +237,110 @@ def _filter_docs_by_keywords(docs: List[Document], question: str) -> List[Docume
         if any(kw in title for kw in keywords) or any(kw in content for kw in keywords):
             filtered.append(doc)
     return filtered
+
+def _build_keyword_document(
+    *,
+    bvid: str,
+    title: str,
+    description: Optional[str],
+    content: Optional[str],
+    owner_name: Optional[str],
+    keywords: List[str],
+    score: float,
+) -> Document:
+    """Build one DB keyword recall document for a video."""
+    parts = [f"视频标题：{title}"]
+    if owner_name:
+        parts.append(f"UP主：{owner_name}")
+    if description:
+        parts.append(f"视频简介：{description}")
+    if content:
+        parts.append("相关片段：" + build_snippet(content, keywords))
+
+    return Document(
+        page_content="\n".join(parts),
+        metadata={
+            "bvid": bvid,
+            "title": title,
+            "owner_name": owner_name or "",
+            "url": f"https://www.bilibili.com/video/{bvid}",
+            "doc_type": "keyword",
+            "chunk_index": -2,
+            "keyword_score": score,
+        },
+    )
+
+async def _keyword_search_docs(
+    db: AsyncSession,
+    folder_ids: List[int],
+    question: str,
+    limit: int,
+) -> List[Document]:
+    """Recall videos from SQLite by weighted keyword matches."""
+    if not folder_ids or limit <= 0:
+        return []
+    keywords = _extract_keywords(question)
+    if not keywords:
+        return []
+
+    like_conds = []
+    for kw in keywords:
+        pattern = f"%{kw}%"
+        like_conds.extend([
+            VideoCache.bvid.ilike(pattern),
+            VideoCache.title.ilike(pattern),
+            VideoCache.description.ilike(pattern),
+            VideoCache.content.ilike(pattern),
+            VideoCache.owner_name.ilike(pattern),
+        ])
+
+    stmt = (
+        select(
+            VideoCache.bvid,
+            VideoCache.title,
+            VideoCache.description,
+            VideoCache.content,
+            VideoCache.owner_name,
+        )
+        .join(FavoriteVideo, FavoriteVideo.bvid == VideoCache.bvid)
+        .where(FavoriteVideo.folder_id.in_(folder_ids))
+        .where(or_(*like_conds))
+        .limit(max(limit * 4, 40))
+    )
+    rows = await db.execute(stmt)
+
+    docs_by_bvid: dict[str, Document] = {}
+    scores_by_bvid: dict[str, float] = {}
+    for bvid, title, description, content, owner_name in rows.fetchall():
+        if not bvid or not title:
+            continue
+        score = keyword_score(
+            keywords,
+            title=title or "",
+            description=description or "",
+            content=content or "",
+            owner_name=owner_name or "",
+        )
+        if score <= 0:
+            continue
+        if score <= scores_by_bvid.get(bvid, 0):
+            continue
+        scores_by_bvid[bvid] = score
+        docs_by_bvid[bvid] = _build_keyword_document(
+            bvid=bvid,
+            title=title,
+            description=description,
+            content=content,
+            owner_name=owner_name,
+            keywords=keywords,
+            score=score,
+        )
+
+    return sorted(
+        docs_by_bvid.values(),
+        key=lambda doc: doc.metadata.get("keyword_score", 0),
+        reverse=True,
+    )[:limit]
 
 async def _is_related_to_collection(db: AsyncSession, folder_ids: List[int], question: str) -> bool:
     """判断问题是否与收藏夹内容有关"""
@@ -379,6 +484,7 @@ async def _get_video_titles_context(db: AsyncSession, folder_ids: List[int], lim
 
 async def _prepare_messages(request: ChatRequest, db: AsyncSession) -> tuple[list[dict], List[dict], str]:
     """准备 LLM 消息与来源信息"""
+    prepare_started = time.perf_counter()
     question = request.question.strip()
     rag = get_rag_service()
     folder_ids = []
@@ -389,18 +495,22 @@ async def _prepare_messages(request: ChatRequest, db: AsyncSession) -> tuple[lis
     has_data = len(bvids) > 0
     is_collection_intent = _is_collection_intent(question)
     is_general = _is_general_question(question)
-    if request.folder_ids:
+    if request.folder_ids and not is_general:
         is_collection_intent = True
-    # 1) LLM 路由优先，失败时降级规则路由
+    # 1) 默认使用规则路由，避免每次回答前额外等待一轮 LLM。
+    route_started = time.perf_counter()
     logger.info(f"路由输入: question={question} folder_ids={folder_ids} has_data={has_data} is_collection_intent={is_collection_intent}")
-    route, route_raw = _route_with_llm(question)
-    route_source = "LLM"
     related: Optional[bool] = None
+    route: Optional[str] = None
+    route_source = "RULE"
+    if settings.chat_use_llm_router and not is_general:
+        route, _route_raw = await asyncio.to_thread(_route_with_llm, question)
+        if route:
+            route_source = "LLM"
     if not route:
-        related = await _is_related_to_collection(db, folder_ids, question)
-        route = _route_with_rules(question, is_collection_intent, related)
+        route = _route_with_rules(question, is_collection_intent, related=False)
         route_source = "RULE"
-    logger.info(f"路由策略: {route_source} => {route}")
+    logger.info(f"路由策略: {route_source} => {route}，耗时={time.perf_counter() - route_started:.2f}s")
     # 纠偏
     if is_general:
         route = "direct"
@@ -414,14 +524,28 @@ async def _prepare_messages(request: ChatRequest, db: AsyncSession) -> tuple[lis
             return messages, sources, question
         messages = _build_direct_messages(question)
         return messages, [], question
-    # 3) 直接回答
+    # 3) 直接回答。非寒暄问题如果能在库里命中关键词，转入检索，避免被路由误杀。
+    if route == "direct":
+        if is_general:
+            return _build_direct_messages(question), [], question
+        if is_collection_intent:
+            route = "vector"
+        else:
+            related = await _is_related_to_collection(db, folder_ids, question)
+            if related:
+                route = "vector"
+            else:
+                title_context = await _get_video_titles_context(db, folder_ids, limit=50)
+                messages = _build_direct_messages_with_context(title_context, question) if title_context else _build_direct_messages(question)
+                return messages, [], question
+
     if route == "direct":
         title_context = await _get_video_titles_context(db, folder_ids, limit=50)
         messages = _build_direct_messages_with_context(title_context, question) if title_context else _build_direct_messages(question)
         return messages, [], question
     # 4) 列表类问题
     if route == "db_list":
-        if related is None:
+        if related is None and not is_collection_intent:
             related = await _is_related_to_collection(db, folder_ids, question)
         if not related and not is_collection_intent:
             return _build_direct_messages(question), [], question
@@ -431,7 +555,7 @@ async def _prepare_messages(request: ChatRequest, db: AsyncSession) -> tuple[lis
         return _build_db_list_messages(context, question), sources, question
     # 5) 总结类问题
     if route == "db_content":
-        if related is None:
+        if related is None and not is_collection_intent:
             related = await _is_related_to_collection(db, folder_ids, question)
         if not related and not is_collection_intent:
             return _build_direct_messages(question), [], question
@@ -439,20 +563,39 @@ async def _prepare_messages(request: ChatRequest, db: AsyncSession) -> tuple[lis
         if not context:
             return _build_fallback_messages("（暂无信息，请入库）", question), sources, question
         return _build_db_summary_messages(context, question), sources, question
-    # 6) 检查相关性
-    if related is None:
-        related = await _is_related_to_collection(db, folder_ids, question)
-    if not related and not is_collection_intent:
-        return _build_direct_messages(question), [], question
-    # 7) 向量检索
-    docs = []
+    # 6) 检查相关性。vector 路由本身就是语义检索意图，不再用关键词 LIKE 提前拦截。
+    if route != "vector":
+        if related is None:
+            related = await _is_related_to_collection(db, folder_ids, question)
+        if not related and not is_collection_intent:
+            return _build_direct_messages(question), [], question
+    # 7) 混合检索：向量 MMR + SQLite 关键词召回，再用 RRF 融合。
+    docs: List[Document] = []
     try:
-        docs = rag.search(question, k=5, bvids=bvids if bvids else None)
+        recall_started = time.perf_counter()
+        top_k = max(1, settings.retrieval_top_k)
+        candidate_k = max(top_k, settings.retrieval_candidate_k)
+        vector_task = asyncio.to_thread(
+            rag.search,
+            question,
+            k=candidate_k,
+            bvids=bvids if bvids else None,
+            fetch_k=max(candidate_k, settings.retrieval_mmr_fetch_k),
+        )
+        keyword_task = _keyword_search_docs(db, folder_ids, question, limit=candidate_k)
+        vector_docs, keyword_docs = await asyncio.gather(vector_task, keyword_task)
+        docs = merge_ranked_documents(
+            {"vector": vector_docs, "keyword": keyword_docs},
+            top_k=top_k,
+            channel_weights={"vector": 1.0, "keyword": 0.9},
+            per_video_limit=2,
+        )
+        logger.info(
+            f"混合检索完成：vector={len(vector_docs)} keyword={len(keyword_docs)} final={len(docs)}，耗时={time.perf_counter() - recall_started:.2f}s"
+        )
     except Exception as e:
-        logger.warning(f"向量检索失败: {e}")
+        logger.warning(f"混合检索失败: {e}")
     if docs:
-        filtered_docs = _filter_docs_by_keywords(docs, question)
-        docs = filtered_docs if filtered_docs else docs
         context_parts, sources, seen_bvids = [], [], set()
         for doc in docs:
             bvid, title, content = doc.metadata.get("bvid", ""), doc.metadata.get("title", ""), doc.page_content.strip()
@@ -460,6 +603,7 @@ async def _prepare_messages(request: ChatRequest, db: AsyncSession) -> tuple[lis
             if bvid and bvid not in seen_bvids:
                 seen_bvids.add(bvid)
                 sources.append({"bvid": bvid, "title": title, "url": f"https://www.bilibili.com/video/{bvid}"})
+        logger.info(f"准备问答上下文完成，耗时={time.perf_counter() - prepare_started:.2f}s")
         return _build_rag_messages("\n\n---\n\n".join(context_parts), question), sources, question
     # 兜底
     context, sources = await _get_video_context(db, folder_ids, include_content=False, limit=50)
@@ -489,11 +633,18 @@ async def ask_question_stream(request: ChatRequest, db: AsyncSession = Depends(g
         messages, sources, _ = await _prepare_messages(request, db)
         client = _get_llm_client()
         def generate():
+            yield (
+                f"{SOURCES_MARKER}"
+                f"{json.dumps(sources[:5], ensure_ascii=False)}"
+                f"{CONTENT_START_MARKER}"
+            )
             stream = client.chat.completions.create(model=settings.llm_model, messages=messages, temperature=0.5, stream=True)
             for chunk in stream:
+                if not chunk.choices:
+                    continue
                 delta = chunk.choices[0].delta
-                if delta and delta.content: yield delta.content
-            yield f"\n[[SOURCES_JSON]]{json.dumps(sources, ensure_ascii=False)}"
+                if delta and delta.content:
+                    yield delta.content
         return StreamingResponse(generate(), media_type="text/plain; charset=utf-8")
     except HTTPException: raise
     except Exception as e:

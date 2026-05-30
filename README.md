@@ -56,12 +56,23 @@ OPENAI_API_KEY=
 OPENAI_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
 LLM_MODEL=qwen3-plus
 EMBEDDING_MODEL=text-embedding-v4
+CHAT_USE_LLM_ROUTER=false
+```
+
+可选的召回参数：
+```env
+RETRIEVAL_CANDIDATE_K=24
+RETRIEVAL_TOP_K=8
+RETRIEVAL_MMR_FETCH_K=32
+RETRIEVAL_MMR_LAMBDA=0.55
 ```
 
 注意：
 - `.env` 必须放在项目根目录，不是 `frontend/` 目录
 - `OPENAI_BASE_URL` 用于 LLM 对话，推荐使用 `https://dashscope.aliyuncs.com/compatible-mode/v1`
 - `DASHSCOPE_BASE_URL` 只用于 ASR，不要和 `OPENAI_BASE_URL` 混用
+- `CHAT_USE_LLM_ROUTER=false` 会跳过每次回答前的额外路由模型调用，首字更快；如需更智能的自动路由可改为 `true`
+- 召回参数通常保持默认即可；如果库很大且想要更高召回，可适当增大 `RETRIEVAL_CANDIDATE_K`
 - 修改 `.env` 后需要重启后端服务
 - 不要把真实 API Key 提交到 GitHub
 
